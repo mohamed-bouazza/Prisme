@@ -1,0 +1,15 @@
+# Backend galerie : authentification, images, catégories, transformations
+flask>=3.0
+flask-cors>=4.0
+flask-sqlalchemy>=3.1      # ORM : manipuler la base avec des objets Python
+flask-migrate>=4.0         # migrations Alembic (évolution du schéma)
+flask-jwt-extended>=4.6    # jetons JWT pour l'authentification
+psycopg[binary]>=3.1       # pilote PostgreSQL
+bcrypt>=4.1                # hachage des mots de passe
+pillow>=10.0               # transformations (crop, resize, rotation...)
+requests>=2.31             # appels à l'API CBIR
+python-dotenv>=1.0
+
+# Développement
+pytest>=8.0
+ruff>=0.5

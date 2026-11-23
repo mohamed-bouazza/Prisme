@@ -1,0 +1,52 @@
+/* Tailwind CSS v4 : les classes utilitaires + nos couleurs et polices (design « Prisme »). */
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", system-ui, sans-serif;
+  --font-display: "Space Grotesk", "Inter", sans-serif;
+
+  /* Couleurs du design (utilisables en classes : bg-ink, text-muted, border-line...) */
+  --color-canvas: #f6f7fb;      /* fond de l'application */
+  --color-line: #e4e7ee;        /* bordures */
+  --color-line-strong: #d5dae3; /* bordures des champs */
+  --color-ink: #0e1525;         /* texte principal, barre latérale */
+  --color-ink-2: #1c2538;       /* élément actif sur fond sombre */
+  --color-ink-3: #161f31;
+  --color-muted: #5b6478;       /* texte secondaire (contraste 5,9:1 sur blanc) */
+  --color-side-text: #c9cfdb;   /* texte de la barre latérale */
+  --color-side-muted: #8b94a8;
+  --color-primary: #4338ca;     /* indigo : actions principales, « pertinente » */
+  --color-primary-hover: #3730a3;
+  --color-primary-soft: #eef0ff;
+  --color-primary-light: #a5b4fc;
+  --color-reject: #c2410c;      /* orange brûlé : « non pertinente » */
+  --color-reject-soft: #fde8e3;
+  --color-reject-ink: #9a2e12;
+  --color-ok: #087a55;
+  --color-ok-soft: #e6f6ef;
+  --color-accent: #f59e0b;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Anneau de focus visible au clavier, cohérent partout */
+:focus-visible {
+  outline: 3px solid rgb(67 56 202 / 0.35);
+  outline-offset: 2px;
+}
+
+input[type="range"] {
+  accent-color: var(--color-primary);
+}

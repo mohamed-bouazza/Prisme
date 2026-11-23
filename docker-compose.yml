@@ -1,0 +1,42 @@
+# ============================================================
+#  Services d'infrastructure lancés avec Docker :
+#    docker compose up -d      -> démarre la base en arrière-plan
+#    docker compose down       -> arrête (les données sont conservées dans le volume)
+#  Les valeurs ${...} viennent du fichier .env
+# ============================================================
+services:
+  db:
+    # PostgreSQL 16 avec l'extension pgvector (stockage de vecteurs de descripteurs)
+    image: pgvector/pgvector:pg16
+    container_name: cbir_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data          # données persistantes
+      - ./infra/db/init:/docker-entrypoint-initdb.d:ro   # scripts exécutés au 1er démarrage
+    healthcheck:
+      # Docker vérifie régulièrement que la base répond
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  adminer:
+    # Petite interface web pour explorer la base : http://localhost:<ADMINER_PORT> (8080 par défaut).
+    # Si 8080 est déjà pris par une autre application, changer ADMINER_PORT dans .env (ex. 8081).
+    image: adminer:4
+    container_name: cbir_adminer
+    restart: unless-stopped
+    ports:
+      - "${ADMINER_PORT:-8080}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

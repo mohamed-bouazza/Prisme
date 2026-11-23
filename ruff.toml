@@ -1,0 +1,17 @@
+# Configuration de Ruff : linter + formateur Python (vérifie et uniformise le style)
+# Utilisation :  ruff check .   |   ruff format .
+# 110 : laisse la place aux commentaires explicatifs en fin de ligne (demandés par l'énoncé)
+line-length = 110
+target-version = "py312"
+# notebooks : code d'exploration (cellules courtes, style compact), le code de référence est dans cbir_api/
+# migrations : fichiers générés automatiquement par Alembic
+extend-exclude = ["data", "storage", ".venv", "notebooks", "gallery_backend/migrations"]
+
+[lint]
+# E/W : style PEP 8, F : erreurs (variables inutilisées...), I : ordre des imports,
+# B : bugs probables, UP : syntaxe Python moderne
+select = ["E", "W", "F", "I", "B", "UP"]
+
+[lint.isort]
+# "cbir" est notre propre paquet : ses imports sont groupés après les bibliothèques externes
+known-first-party = ["cbir", "resources", "app", "gallery"]

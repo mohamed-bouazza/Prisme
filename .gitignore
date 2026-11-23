@@ -1,0 +1,46 @@
+# ============================================================
+#  .gitignore — fichiers et dossiers à NE PAS versionner / rendre
+#  (l'énoncé interdit de rendre la base d'images et les dossiers générés)
+# ============================================================
+
+# --- Base d'images (GHIM-10K) : à télécharger depuis Kaggle ---
+data/
+
+# --- Fichiers générés par l'application ---
+# images uploadées + miniatures
+storage/
+# index des descripteurs (régénérable avec build_index.py)
+# (un commentaire doit être sur sa propre ligne : en fin de ligne, il ferait partie du motif)
+cbir_api/index/
+*.npy
+*.npz
+
+# --- Secrets / configuration locale ---
+.env
+*.local
+
+# --- Python ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.egg-info/
+
+# --- Frontend (Node) ---
+node_modules/
+frontend/dist/
+
+# --- Éditeurs / système ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Résultats d'évaluation (régénérables avec cbir_api/scripts/evaluate.py)
+reports/
+
+# Cache de compilation TypeScript (régénéré par tsc -b)
+*.tsbuildinfo

@@ -1,0 +1,339 @@
+"""Images : lister, envoyer (une ou plusieurs), télécharger (une ou plusieurs), supprimer,
+transformer, consulter les descripteurs.
+
+Chaque image créée (upload ou transformation) est aussi **indexée dans l'API CBIR**, pour pouvoir
+servir de requête et apparaître dans les résultats de recherche. Si l'API CBIR est arrêtée, l'image est
+quand même enregistrée (``indexed = false``) et pourra être indexée plus tard (route /reindex).
+"""
+
+from __future__ import annotations
+
+import io
+import zipfile
+from pathlib import PurePath
+
+from flask import Blueprint, current_app, request, send_file
+from flask_jwt_extended import jwt_required
+from sqlalchemy import func, select
+from werkzeug.exceptions import BadRequest
+
+from gallery.api.categories import category_path, descendant_ids
+from gallery.api.common import (
+    current_user_id,
+    get_own_image,
+    get_visible_category,
+    get_visible_image,
+    id_list,
+    int_arg,
+    json_body,
+    visible,
+)
+from gallery.cbir_client import CbirError, CbirUnavailable, get_cbir
+from gallery.extensions import db
+from gallery.models import Image
+from gallery.storage import (
+    InvalidImage,
+    absolute_path,
+    delete_files,
+    encode,
+    open_image_bytes,
+    save_user_file,
+    thumbnail_path,
+)
+from gallery.transforms import apply_operations
+
+bp = Blueprint("images", __name__, url_prefix="/api/images")
+
+ORDERS = {
+    "newest": Image.created_at.desc(),
+    "oldest": Image.created_at.asc(),
+    "name": Image.filename.asc(),
+}
+
+
+def safe_filename(name: str | None, default: str = "image") -> str:
+    """Nom d'affichage : on ne garde que la partie après le dernier / ou \\ (jamais un chemin)."""
+    name = PurePath(str(name or "").replace("\\", "/")).name.strip()
+    return (name or default)[:255]
+
+
+def index_in_cbir(image: Image) -> str | None:
+    """Ajoute l'image à l'index CBIR. Renvoie un avertissement (texte) en cas d'échec, sinon None."""
+    try:
+        get_cbir().index_add(image.cbir_id, absolute_path(image))
+        image.indexed = True
+    except CbirError as exc:
+        if exc.status == 409:                               # déjà indexée : c'est l'état voulu
+            image.indexed = True
+            return None
+        return f"{image.filename} : indexation refusée ({exc})"
+    except CbirUnavailable:
+        return f"{image.filename} : API CBIR indisponible, image non indexée (réessayer avec /reindex)"
+    return None
+
+
+def create_image(uid: int, data: bytes, filename: str, category_id: int | None, *,
+                 source: str = "upload", parent: Image | None = None, ops: list | None = None) -> Image:
+    """Vérifie, enregistre le fichier et crée la ligne en base (sans commit)."""
+    pil = open_image_bytes(data)
+    fmt = pil.format
+    rel = save_user_file(uid, data, fmt)
+    image = Image(
+        owner_id=uid, category_id=category_id, filename=filename, location="storage", path=rel,
+        cbir_id=rel,                                        # chemin unique -> identifiant unique dans l'index
+        width=pil.width, height=pil.height, size_bytes=len(data), format=fmt,
+        source=source, parent_id=parent.id if parent else None, transform=ops,
+    )
+    db.session.add(image)
+    return image
+
+
+def _category_arg(value, uid: int) -> int | None:
+    """Catégorie où RANGER une image de l'utilisateur : une des siennes OU une catégorie publique
+    (ex. GHIM-10K / yacht). Ranger son image dans « yacht » ne modifie pas la catégorie publique :
+    l'image reste privée, seule l'étiquette est partagée. Les catégories d'un autre : 404."""
+    if value in (None, "", "null"):
+        return None
+    try:
+        return get_visible_category(int(value), uid).id
+    except ValueError as exc:
+        raise BadRequest("'category_id' doit être un entier") from exc
+
+
+# --------------------------------------------------------------------------- liste
+@bp.get("")
+@jwt_required()
+def list_images():
+    """Liste paginée et filtrable.
+
+    Paramètres : scope (all | mine | public), category_id, recursive (1/0), uncategorized (1),
+    q (recherche dans le nom), source, order (newest | oldest | name), page, per_page.
+    """
+    uid = current_user_id()
+    args = request.args
+    q = select(Image).where(visible(Image, uid))
+
+    scope = args.get("scope", "all")
+    if scope == "mine":
+        q = q.where(Image.owner_id == uid)
+    elif scope == "public":
+        q = q.where(Image.owner_id.is_(None))
+    elif scope != "all":
+        raise BadRequest("'scope' : all, mine ou public")
+
+    if args.get("category_id"):
+        cat = get_visible_category(int(args["category_id"]), uid)
+        ids = descendant_ids(cat.id) if args.get("recursive", "1") != "0" else [cat.id]
+        q = q.where(Image.category_id.in_(ids))
+    elif args.get("uncategorized") == "1":
+        q = q.where(Image.category_id.is_(None))
+    if args.get("q"):
+        q = q.where(Image.filename.ilike(f"%{args['q'].strip()}%"))   # ilike : insensible à la casse
+    if args.get("source"):
+        q = q.where(Image.source == args["source"])
+
+    order = ORDERS.get(args.get("order", "newest"))
+    if order is None:
+        raise BadRequest(f"'order' : {', '.join(ORDERS)}")
+    page = int_arg("page", 1, 1, 100_000)
+    per_page = int_arg("per_page", 40, 1, 100)
+
+    total = db.session.scalar(select(func.count()).select_from(q.subquery()))
+    page_q = q.order_by(order, Image.id.desc()).limit(per_page).offset((page - 1) * per_page)
+    items = db.session.scalars(page_q)
+    return {
+        "items": [img.to_dict(uid) for img in items],
+        "total": total, "page": page, "per_page": per_page,
+        "pages": max(1, -(-total // per_page)),            # division arrondie au supérieur
+    }
+
+
+# -------------------------------------------------------------------------- upload
+@bp.post("")
+@jwt_required()
+def upload_images():
+    """Envoi d'une ou plusieurs images (multipart/form-data, champ ``files`` répété).
+
+    Succès partiel possible : les fichiers valides sont enregistrés, les autres listés dans ``errors``.
+    """
+    uid = current_user_id()
+    files = request.files.getlist("files")
+    if not files:
+        raise BadRequest("Aucun fichier (champ 'files', multipart/form-data)")
+    category_id = _category_arg(request.form.get("category_id"), uid)
+    max_bytes = current_app.config["MAX_FILE_MB"] * 1024 * 1024
+
+    created, errors = [], []
+    for f in files:
+        name = safe_filename(f.filename)
+        data = f.read()
+        if len(data) > max_bytes:
+            errors.append({"filename": name, "error": f"fichier > {current_app.config['MAX_FILE_MB']} Mo"})
+            continue
+        try:
+            created.append(create_image(uid, data, name, category_id))
+        except InvalidImage as exc:
+            errors.append({"filename": name, "error": str(exc)})
+    db.session.commit()                                     # obtient les ids
+
+    warnings = [w for img in created if (w := index_in_cbir(img))]
+    db.session.commit()                                     # enregistre indexed = True
+    status = 201 if created else 400
+    return {"images": [i.to_dict(uid) for i in created], "errors": errors, "warnings": warnings}, status
+
+
+# --------------------------------------------------------------- détail, fichier
+@bp.get("/<int:image_id>")
+@jwt_required()
+def get_image(image_id: int):
+    uid = current_user_id()
+    image = get_visible_image(image_id, uid)
+    data = image.to_dict(uid)
+    data["category_path"] = category_path(image.category)
+    data["has_descriptors"] = image.descriptors is not None
+    return {"image": data}
+
+
+@bp.patch("/<int:image_id>")
+@jwt_required()
+def update_image(image_id: int):
+    """Renommer et/ou changer de catégorie."""
+    uid = current_user_id()
+    image = get_own_image(image_id, uid)
+    data = json_body()
+    if "filename" in data:
+        image.filename = safe_filename(data["filename"], image.filename)
+    if "category_id" in data:
+        image.category_id = _category_arg(data["category_id"], uid)
+    db.session.commit()
+    return {"image": image.to_dict(uid)}
+
+
+@bp.get("/<int:image_id>/file")
+@jwt_required()
+def get_file(image_id: int):
+    """Le fichier original. ``?download=1`` : proposé au téléchargement (Content-Disposition)."""
+    image = get_visible_image(image_id, current_user_id())
+    return send_file(absolute_path(image), as_attachment=request.args.get("download") == "1",
+                     download_name=image.filename, max_age=3600)
+
+
+@bp.get("/<int:image_id>/thumb")
+@jwt_required()
+def get_thumb(image_id: int):
+    image = get_visible_image(image_id, current_user_id())
+    return send_file(thumbnail_path(image), mimetype="image/jpeg", max_age=86400)
+
+
+@bp.post("/download")
+@jwt_required()
+def download_many():
+    """Plusieurs images dans une archive ZIP. Corps : {"ids": [1, 2, 3]} (200 au maximum)."""
+    uid = current_user_id()
+    ids = id_list(json_body(), max_len=200)
+    images = [get_visible_image(i, uid) for i in ids]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:  # JPEG déjà compressé : on ne recompresse pas
+        for img in images:
+            zf.write(absolute_path(img), arcname=f"{img.id}_{img.filename}")   # préfixe id : pas de collision
+    buf.seek(0)
+    return send_file(buf, mimetype="application/zip", as_attachment=True, download_name="images.zip")
+
+
+# ---------------------------------------------------------------------- suppression
+def _delete(image: Image) -> str | None:
+    warning = None
+    if image.indexed:
+        try:
+            get_cbir().index_remove(image.cbir_id)
+        except (CbirUnavailable, CbirError) as exc:
+            warning = f"{image.filename} : non retirée de l'index CBIR ({exc})"
+    delete_files(image)
+    db.session.delete(image)
+    return warning
+
+
+@bp.delete("/<int:image_id>")
+@jwt_required()
+def delete_image(image_id: int):
+    image = get_own_image(image_id, current_user_id())
+    warning = _delete(image)
+    db.session.commit()
+    return {"deleted": [image_id], "warnings": [warning] if warning else []}
+
+
+@bp.post("/bulk-delete")
+@jwt_required()
+def delete_many():
+    """Suppression multiple. Corps : {"ids": [...]}.
+
+    Toutes doivent appartenir à l'utilisateur, sinon rien n'est supprimé (tout ou rien).
+    """
+    uid = current_user_id()
+    images = [get_own_image(i, uid) for i in id_list(json_body())]   # vérifie TOUT avant de supprimer
+    warnings = [w for img in images if (w := _delete(img))]
+    db.session.commit()
+    return {"deleted": [img.id for img in images], "warnings": warnings}
+
+
+# -------------------------------------------------------------------- transformation
+@bp.post("/<int:image_id>/transform")
+@jwt_required()
+def transform_image(image_id: int):
+    """Crée une NOUVELLE image en appliquant des opérations à une image visible (même de la base).
+
+    Corps : {"operations": [{"op": "crop", ...}, ...], "filename": "...", "category_id": ...}
+    L'image d'origine n'est jamais modifiée.
+    """
+    from PIL import Image as PILImage
+
+    uid = current_user_id()
+    source = get_visible_image(image_id, uid)
+    data = json_body()
+    ops = data.get("operations")
+    with PILImage.open(absolute_path(source)) as img:
+        out = apply_operations(img, ops)                    # TransformError -> 400
+    fmt = "PNG" if source.format == "PNG" else "JPEG"
+    stem = PurePath(source.filename).stem
+    default_name = f"{stem}_transform.{'png' if fmt == 'PNG' else 'jpg'}"
+    category_id = _category_arg(data["category_id"], uid) if "category_id" in data else (
+        source.category_id if not source.is_public else None)
+    new = create_image(uid, encode(out, fmt), safe_filename(data.get("filename"), default_name), category_id,
+                       source="transform", parent=source, ops=ops)
+    db.session.commit()
+    warning = index_in_cbir(new)
+    db.session.commit()
+    return {"image": new.to_dict(uid), "warnings": [warning] if warning else []}, 201
+
+
+# ---------------------------------------------------------------------- descripteurs
+@bp.get("/<int:image_id>/descriptors")
+@jwt_required()
+def get_descriptors(image_id: int):
+    """Descripteurs couleur/texture (Tâche 1). Calculés une fois par l'API CBIR puis mis en cache (JSONB)."""
+    uid = current_user_id()
+    image = get_visible_image(image_id, uid)
+    cached = image.descriptors is not None and request.args.get("refresh") != "1"
+    if not cached:
+        result = get_cbir().descriptors(absolute_path(image))
+        image.descriptors = result["descriptors"]
+        db.session.commit()
+    return {"image_id": image.id, "cached": cached, "descriptors": image.descriptors}
+
+
+@bp.post("/<int:image_id>/reindex")
+@jwt_required()
+def reindex(image_id: int):
+    image = get_own_image(image_id, current_user_id())
+    warning = index_in_cbir(image)
+    db.session.commit()
+    return {"indexed": image.indexed, "warnings": [warning] if warning else []}
+
+
+# ------------------------------------------------------------------------- utilitaire
+def images_by_cbir_ids(cbir_ids: list[str], uid: int) -> dict[str, Image]:
+    """{cbir_id: Image} pour les ids visibles par l'utilisateur (une seule requête SQL)."""
+    if not cbir_ids:
+        return {}
+    rows = db.session.scalars(select(Image).where(Image.cbir_id.in_(cbir_ids), visible(Image, uid)))
+    return {img.cbir_id: img for img in rows}

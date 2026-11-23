@@ -1,0 +1,10 @@
+# Fins de ligne : Git stocke et extrait les fichiers texte en LF (cohérent avec .editorconfig),
+# quel que soit le réglage core.autocrlf de chaque membre du groupe.
+* text=auto eol=lf
+
+# Fichiers binaires : jamais modifiés par Git
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary
+*.docx binary
